@@ -66,5 +66,3 @@ dmypy.json
 # Redis
 dump.rdb
 
-# Other
-/plans
