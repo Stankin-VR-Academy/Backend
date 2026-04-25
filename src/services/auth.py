@@ -16,11 +16,13 @@ from core.config import settings
 from core.logger import get_logger
 from src.database.database import get_db
 from src.models.user import User
+from src.services.redis_client import redis_client
 
 PASSWORD_SCHEME = "pbkdf2_sha256"
 PBKDF2_ITERATIONS = 100_000
 security = HTTPBearer()
 logger = get_logger({"module": "auth_service"})
+TOKEN_BLACKLIST_PREFIX = "auth:blacklist"
 
 
 def _utc_now() -> datetime:
@@ -101,6 +103,39 @@ def decode_token(token: str) -> dict[str, Any]:
         ) from error
 
 
+def _get_blacklist_key(token: str) -> str:
+    return f"{TOKEN_BLACKLIST_PREFIX}:{token}"
+
+
+async def revoke_access_token(token: str) -> None:
+    payload = decode_token(token)
+    if payload.get("type") != "access":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only access token can be revoked",
+        )
+
+    exp = payload.get("exp")
+    if not isinstance(exp, int):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid token payload",
+        )
+
+    ttl_seconds = max(exp - int(_utc_now().timestamp()), 1)
+    if redis_client.redis is not None:
+        await redis_client.redis.set(_get_blacklist_key(token), "1", ex=ttl_seconds)
+    else:
+        logger.warning("Redis is unavailable, token revoke skipped")
+
+
+async def is_access_token_revoked(token: str) -> bool:
+    if redis_client.redis is None:
+        return False
+    value = await redis_client.redis.get(_get_blacklist_key(token))
+    return value is not None
+
+
 async def get_user_by_email(db: AsyncSession, email: str) -> User | None:
     result = await db.execute(select(User).where(User.email == email))
     return result.scalar_one_or_none()
@@ -134,7 +169,14 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    payload = decode_token(credentials.credentials)
+    token = credentials.credentials
+    if await is_access_token_revoked(token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been revoked",
+        )
+
+    payload = decode_token(token)
     if payload.get("type") != "access":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

@@ -18,7 +18,7 @@ class RoomBase(BaseModel):
 
 
 class RoomCreate(RoomBase):
-    server_id: UUID
+    pass
 
 
 class RoomUpdate(BaseModel):
@@ -33,7 +33,6 @@ class RoomUpdate(BaseModel):
 
 class RoomResponse(BaseModel):
     id: UUID
-    server_id: UUID
     name: str
     description: Optional[str] = None
     room_type: RoomType

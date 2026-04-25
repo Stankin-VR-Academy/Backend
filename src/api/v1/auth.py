@@ -1,6 +1,7 @@
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,6 +19,8 @@ from src.services.auth import (
     get_user_by_id,
     get_user_by_username,
     hash_password,
+    revoke_access_token,
+    security,
 )
 
 router = APIRouter()
@@ -59,7 +62,7 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)) ->
         logger.exception(f"Unexpected register error for email={user_data.email}: {error}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Unexpected server error",
+            detail=f"Unexpected server error: {error}",
         ) from error
 
 
@@ -86,13 +89,11 @@ async def login(credentials: UserLogin, db: AsyncSession = Depends(get_db)) -> A
         )
         logger.info(f"Login success for user_id={user.id}")
         return response
-    except HTTPException:
-        raise
     except Exception as error:
-        logger.exception(f"Unexpected login error for email={credentials.email}: {error}")
+        logger.exception(f"Login error for email={credentials.email}: {error}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Unexpected server error",
+            detail=f"Login error: {error}",
         ) from error
 
 
@@ -123,8 +124,6 @@ async def refresh_token(token_data: TokenRefresh, db: AsyncSession = Depends(get
             "token_type": "bearer",
             "expires_in": settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         }
-    except HTTPException:
-        raise
     except Exception as error:
         logger.exception(f"Unexpected refresh error: {error}")
         raise HTTPException(
@@ -134,12 +133,21 @@ async def refresh_token(token_data: TokenRefresh, db: AsyncSession = Depends(get
 
 
 @router.post("/logout")
-async def logout() -> Any:
+async def logout(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Any:
     """
     Выход из системы.
 
-    **Заглушка:** Возвращает успешное сообщение.
+    Добавляет текущий access токен в blacklist до его истечения.
     """
     logger.info("Logout attempt")
-    # TODO: Реализовать логику выхода
-    return {"message": "Successfully logged out"}
+    try:
+        await revoke_access_token(credentials.credentials)
+        return {"message": "Successfully logged out"}
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception(f"Unexpected logout error: {error}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unexpected server error",
+        ) from error
