@@ -36,10 +36,8 @@ class User(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
     # Relationships
-    owned_servers = relationship("Server", back_populates="owner", cascade="all, delete-orphan")
-    server_memberships = relationship("ServerMember", back_populates="user", cascade="all, delete-orphan")
     room_memberships = relationship("RoomMember", back_populates="user", cascade="all, delete-orphan")
-    created_rooms = relationship("Room", back_populates="created_by", cascade="all, delete-orphan")
+    created_rooms = relationship("Room", back_populates="created_by_user", cascade="all, delete-orphan")
     user_sessions = relationship("UserSession", back_populates="user", cascade="all, delete-orphan")
     messages = relationship("Message", back_populates="user", cascade="all, delete-orphan")
     room_join_tokens = relationship("RoomJoinToken", back_populates="user", cascade="all, delete-orphan")

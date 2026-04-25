@@ -19,16 +19,6 @@ from src.schemas.room import (
     RoomType,
     RoomUpdate,
 )
-from src.schemas.server import (
-    ServerBase,
-    ServerCreate,
-    ServerDetailResponse,
-    ServerMemberBase,
-    ServerMemberResponse,
-    ServerMemberUpdate,
-    ServerResponse,
-    ServerUpdate,
-)
 from src.schemas.session import (
     JoinRoomRequest,
     JoinRoomResponse,

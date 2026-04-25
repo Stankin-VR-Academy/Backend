@@ -20,7 +20,6 @@ class Room(Base):
     __tablename__ = "rooms"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    server_id = Column(UUID(as_uuid=True), ForeignKey("servers.id", ondelete="CASCADE"), nullable=False, index=True)
     name = Column(String(100), nullable=False)
     description = Column(Text, nullable=True)
     room_type = Column(String(20), nullable=False, default=RoomType.CLASSROOM, index=True)
@@ -33,7 +32,6 @@ class Room(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
     # Relationships
-    server = relationship("Server", back_populates="rooms")
     created_by_user = relationship("User", back_populates="created_rooms")
     members = relationship("RoomMember", back_populates="room", cascade="all, delete-orphan")
     user_sessions = relationship("UserSession", back_populates="room", cascade="all, delete-orphan")
@@ -46,4 +44,4 @@ class Room(Base):
     )
 
     def __repr__(self):
-        return f"<Room(id={self.id}, name={self.name}, server_id={self.server_id})>"
+        return f"<Room(id={self.id}, name={self.name})>"
