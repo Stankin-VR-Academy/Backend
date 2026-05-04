@@ -24,7 +24,7 @@ from src.services.auth import (
 )
 
 router = APIRouter()
-logger = get_logger({"module": "auth"})
+logger = get_logger()
 
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)

@@ -1,7 +1,7 @@
 # API v1 module
 from fastapi import APIRouter
 
-from src.api.v1 import auth, chat, profiles, rooms, sessions
+from src.api.v1 import auth, chat, profiles, realtime, rooms, sessions
 
 api_router = APIRouter()
 
@@ -11,3 +11,4 @@ api_router.include_router(profiles.router, prefix="/profiles", tags=["Profiles"]
 api_router.include_router(rooms.router, prefix="/rooms", tags=["Rooms"])
 api_router.include_router(sessions.router, prefix="/sessions", tags=["Sessions"])
 api_router.include_router(chat.router, prefix="/chat", tags=["Chat"])
+api_router.include_router(realtime.router, prefix="/ws", tags=["Realtime"])

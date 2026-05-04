@@ -1,0 +1,10 @@
+python -m venv .venv
+.venv\\Scripts\\activate
+pip install -r requirements.txt
+
+const ws = new WebSocket("ws://213.165.219.60:8000/api/v1/ws/rooms/967e4fb2-680c-44b1-abc0-71578b76c172?token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwZGJlOWY0OS1kOGNmLTRjMDctOTdiYy1iOTE4NDhiM2Q3YjEiLCJlbWFpbCI6InVzZXIxQGV4YW1wbGUuY29tIiwidHlwZSI6ImFjY2VzcyIsImlhdCI6MTc3NzgwNjAwNiwiZXhwIjoxNzc3OTg2MDA2fQ.0JB2UvAEVQLXTT3aI-OF-ESBQ-9RermXGg0Y2gLfkbA");
+
+ws.onopen = () => console.log("✅ Connected");
+ws.onmessage = (e) => console.log("📩 Message:", e.data);
+ws.onerror = (e) => console.log("❌ Error:", e);
+ws.onclose = (e) => console.log("🔒 Closed:", e);

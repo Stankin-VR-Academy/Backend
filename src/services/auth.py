@@ -132,8 +132,12 @@ async def revoke_access_token(token: str) -> None:
 async def is_access_token_revoked(token: str) -> bool:
     if redis_client.redis is None:
         return False
-    value = await redis_client.redis.get(_get_blacklist_key(token))
-    return value is not None
+    try:
+        value = await redis_client.redis.get(_get_blacklist_key(token))
+        return value is not None
+    except Exception as error:
+        logger.warning(f"Redis blacklist check failed, treating token as not revoked: {error}")
+        return False
 
 
 async def get_user_by_email(db: AsyncSession, email: str) -> User | None:
@@ -146,10 +150,16 @@ async def get_user_by_username(db: AsyncSession, username: str) -> User | None:
     return result.scalar_one_or_none()
 
 
-async def get_user_by_id(db: AsyncSession, user_id: str) -> User | None:
+async def get_user_by_id(db: AsyncSession, user_id: Any) -> User | None:
+    """Разбор user id из JWT; при невалидном формате возвращает None (не бросает TypeError)."""
+    if user_id is None:
+        return None
     try:
-        normalized_user_id = UUID(user_id)
-    except ValueError:
+        if isinstance(user_id, UUID):
+            normalized_user_id = user_id
+        else:
+            normalized_user_id = UUID(str(user_id).strip())
+    except (ValueError, TypeError):
         return None
 
     result = await db.execute(select(User).where(User.id == normalized_user_id))

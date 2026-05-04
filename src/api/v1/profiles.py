@@ -10,7 +10,7 @@ from src.schemas.user import UserResponse, UserUpdate
 from src.services.auth import get_current_user
 
 router = APIRouter()
-logger = get_logger({"module": "profiles"})
+logger = get_logger()
 
 
 @router.get("/me", response_model=UserResponse)

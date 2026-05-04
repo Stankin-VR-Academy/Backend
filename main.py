@@ -1,5 +1,5 @@
-from contextlib import asynccontextmanager
 import asyncio
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
@@ -36,14 +36,9 @@ async def lifespan(app: FastAPI):
                 break
         except Exception as e:
             if attempt == max_attempts:
-                logger.exception(
-                    f"Failed to connect to database after {max_attempts} attempts: {e}"
-                )
+                logger.exception(f"Failed to connect to database after {max_attempts} attempts: {e}")
             else:
-                logger.warning(
-                    f"Database connection attempt {attempt}/{max_attempts} failed: {e}. "
-                    f"Retrying in {retry_delay_seconds}s..."
-                )
+                logger.warning(f"Database connection attempt {attempt}/{max_attempts} failed: {e}. Retrying in {retry_delay_seconds}s...")
                 await asyncio.sleep(retry_delay_seconds)
 
     yield

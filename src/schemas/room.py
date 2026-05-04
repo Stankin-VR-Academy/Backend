@@ -68,6 +68,7 @@ class RoomMemberResponse(BaseModel):
     user_id: UUID
     role: str
     joined_at: datetime
+    user: Optional[UserResponse] = None
 
     class Config:
         from_attributes = True

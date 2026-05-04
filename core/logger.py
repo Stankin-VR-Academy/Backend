@@ -1,7 +1,10 @@
 import logging
 import sys
+from datetime import timedelta, timezone
 
 from loguru import logger
+
+MSK_TZ = timezone(timedelta(hours=3))
 
 logger.remove()
 
@@ -38,9 +41,7 @@ def format_extra(record):
     """Форматирование extra значений с разделителем |."""
     extra = record["extra"]
     # Исключаем стандартные поля loguru
-    extra_filtered = {
-        k: v for k, v in extra.items() if k not in ["name", "function", "line", "file_path", "clickable_path"]
-    }
+    extra_filtered = {k: v for k, v in extra.items() if k not in ["name", "function", "line", "file_path", "clickable_path"]}
 
     if not extra_filtered:
         return ""
@@ -60,16 +61,13 @@ def format_path(record):
 
 
 LOG_FORMAT = (
-    "<green>{time:DD.MM.YYYY HH:mm:ss}</green> | "
-    "<level>{level: <8}</level> | "
-    "<cyan>{extra[path]}</cyan> | "
-    "<level>{message}</level>"
-    "{extra[formatted]}"
+    "<green>{time:DD.MM.YYYY HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{extra[path]}</cyan> | <level>{message}</level>{extra[formatted]}"
 )
 
 
 def formatter(record):
     """Кастомный форматтер для логов."""
+    record["time"] = record["time"].astimezone(MSK_TZ)
     record["extra"]["formatted"] = format_extra(record)
     record["extra"]["path"] = format_path(record)
     return LOG_FORMAT + "\n"

@@ -14,7 +14,7 @@ from src.schemas.message import (
 )
 
 router = APIRouter()
-logger = get_logger({"module": "chat"})
+logger = get_logger()
 
 
 @router.get("/rooms/{room_id}/messages", response_model=List[MessageResponse])
