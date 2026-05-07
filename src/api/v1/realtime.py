@@ -8,14 +8,20 @@
 - ``{"type": "transform", "position": {"x":..,"y":..,"z":..}, "rotation": {"x":..,"y":..,"z":..}, "client_ts": <ms>}``
 - ``{"type": "ping", "client_ts": <ms>}``
 - ``{"type": "request_snapshot"}``
+- ``{"type": "spawn_object", "prefab": <str>, "transform": {...}, "data": {...}, "ephemeral": <bool>, "client_request_id": <str|null>}``
+- ``{"type": "transform_object", "object_id": <uuid>, "transform": {...}, "client_ts": <ms|null>}``
+- ``{"type": "destroy_object", "object_id": <uuid>}``
 
 Сервер -> клиент:
-- ``{"type": "init", "room_id": <uuid>, "self_user_id": <uuid>, "server_ts": <s>, "participants": [...]}``
+- ``{"type": "init", "room_id": <uuid>, "self_user_id": <uuid>, "server_ts": <s>, "participants": [...], "objects": [...]}``
 - ``{"type": "join", "user_id": <uuid>, "username": <str|null>, "server_ts": <s>, "transform": {...}}``
 - ``{"type": "leave", "user_id": <uuid>, "server_ts": <s>}``
 - ``{"type": "transform", "user_id": <uuid>, "position": {...}, "rotation": {...}, "server_ts": <s>, "client_ts": <ms|null>}``
-- ``{"type": "snapshot", "server_ts": <s>, "participants": [...]}``
+- ``{"type": "snapshot", "server_ts": <s>, "participants": [...], "objects": [...]}``
 - ``{"type": "pong", "server_ts": <s>, "client_ts": <ms|null>}``
+- ``{"type": "object_spawned", "object_id": <uuid>, "owner_user_id": <uuid>, "prefab": <str>, "transform": {...}, "data": {...}, "ephemeral": <bool>, "server_ts": <s>, "client_request_id": <str|null>}``
+- ``{"type": "object_transformed", "object_id": <uuid>, "by_user_id": <uuid>, "transform": {...}, "server_ts": <s>, "client_ts": <ms|null>}``
+- ``{"type": "object_destroyed", "object_id": <uuid>, "by_user_id": <uuid>, "server_ts": <s>, "reason": <str>}``
 - ``{"type": "error", "code": <str>, "message": <str>}``
 
 Аутентификация выполняется через query-параметр ``token`` (JWT access token).
@@ -38,23 +44,30 @@ from core.config import settings
 from core.logger import get_logger
 from src.database.database import AsyncSessionLocal
 from src.models.room import Room
+from src.models.room_member import RoomMember, RoomMemberRole
 from src.models.user import User
 from src.schemas.sync import (
+    IncomingDestroyObject,
     IncomingMessageType,
     IncomingPing,
     IncomingSnapshotRequest,
+    IncomingSpawnObject,
     IncomingTransform,
+    IncomingTransformObject,
     OutgoingError,
     OutgoingInit,
     OutgoingJoin,
     OutgoingLeave,
+    OutgoingObjectDestroyed,
+    OutgoingObjectSpawned,
+    OutgoingObjectTransformed,
     OutgoingPong,
     OutgoingSnapshot,
     OutgoingTransform,
     TransformPayload,
 )
 from src.services.redis_client import redis_client
-from src.services.room_sync import room_sync_manager
+from src.services.room_sync import ObjectError, room_sync_manager
 
 router = APIRouter()
 logger = get_logger()
@@ -135,17 +148,29 @@ ws(s)://<host>/api/v1/ws/rooms/{room_id}?token=<JWT access token>
 
 - `transform` — обновление позиции и поворота игрока (отправляйте 30–90 раз/сек)
 - `ping` — измерение RTT (сервер ответит `pong` с тем же `client_ts`)
-- `request_snapshot` — запросить полное состояние всех участников
+- `request_snapshot` — запросить полное состояние всех участников и объектов
+- `spawn_object` — создать объект в комнате; сервер вернёт `object_spawned` с `object_id`
+- `transform_object` — обновить transform объекта (только владельцу или модератору)
+- `destroy_object` — удалить объект (только владельцу или модератору)
 
 ### Сообщения от сервера
 
-- `init` — отправляется один раз при подключении: список текущих участников
+- `init` — отправляется один раз при подключении: список текущих участников и объектов
 - `join` — другим клиентам, когда вошёл новый участник
 - `leave` — другим клиентам при отключении
 - `transform` — широковещательно; отправителю не дублируется
-- `snapshot` — ответ на `request_snapshot`
+- `snapshot` — ответ на `request_snapshot` (участники + объекты)
 - `pong` — ответ на `ping`
-- `error` — `{code, message}` при невалидном payload
+- `object_spawned` — рассылается ВСЕМ (включая отправителя `spawn_object`) с финальным `object_id`
+- `object_transformed` — рассылается всем кроме автора (low-latency, у автора уже есть локальное состояние)
+- `object_destroyed` — рассылается ВСЕМ; `reason` ∈ `user_request | owner_disconnected | room_closed`
+- `error` — `{code, message}` при невалидном payload, нарушении прав или превышении лимитов
+
+### Лимиты по объектам
+
+- максимум 256 объектов на комнату
+- максимум 32 объектов на пользователя
+- объекты с `ephemeral: true` автоматически уничтожаются при отключении владельца
 """
 
 
@@ -168,6 +193,32 @@ _REALTIME_DOC_EXAMPLE = _RealtimeProtocolDoc(
         },
         "ping": {"type": "ping", "client_ts": 1714680000123},
         "request_snapshot": {"type": "request_snapshot"},
+        "spawn_object": {
+            "type": "spawn_object",
+            "prefab": "marker",
+            "transform": {
+                "position": {"x": 1.0, "y": 1.5, "z": -2.0},
+                "rotation": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+            },
+            "data": {"color": "#ff0000"},
+            "ephemeral": False,
+            "client_request_id": "client-tmp-1",
+        },
+        "transform_object": {
+            "type": "transform_object",
+            "object_id": "44444444-4444-4444-4444-444444444444",
+            "transform": {
+                "position": {"x": 1.2, "y": 1.5, "z": -2.0},
+                "rotation": {"x": 0.0, "y": 45.0, "z": 0.0},
+                "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+            },
+            "client_ts": 1714680000600,
+        },
+        "destroy_object": {
+            "type": "destroy_object",
+            "object_id": "44444444-4444-4444-4444-444444444444",
+        },
     },
     server_to_client={
         "init": {
@@ -185,6 +236,21 @@ _REALTIME_DOC_EXAMPLE = _RealtimeProtocolDoc(
                         "client_ts": None,
                     },
                     "server_ts": 1714679999.500,
+                }
+            ],
+            "objects": [
+                {
+                    "object_id": "44444444-4444-4444-4444-444444444444",
+                    "owner_user_id": "22222222-2222-2222-2222-222222222222",
+                    "prefab": "marker",
+                    "transform": {
+                        "position": {"x": 1.0, "y": 1.5, "z": -2.0},
+                        "rotation": {"x": 0.0, "y": 0.0, "z": 0.0},
+                        "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+                    },
+                    "data": {"color": "#ff0000"},
+                    "ephemeral": False,
+                    "server_ts": 1714679999.700,
                 }
             ],
         },
@@ -216,18 +282,59 @@ _REALTIME_DOC_EXAMPLE = _RealtimeProtocolDoc(
             "type": "snapshot",
             "server_ts": 1714680000.800,
             "participants": [],
+            "objects": [],
         },
         "pong": {
             "type": "pong",
             "server_ts": 1714680000.900,
             "client_ts": 1714680000123,
         },
+        "object_spawned": {
+            "type": "object_spawned",
+            "object_id": "44444444-4444-4444-4444-444444444444",
+            "owner_user_id": "22222222-2222-2222-2222-222222222222",
+            "prefab": "marker",
+            "transform": {
+                "position": {"x": 1.0, "y": 1.5, "z": -2.0},
+                "rotation": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+            },
+            "data": {"color": "#ff0000"},
+            "ephemeral": False,
+            "server_ts": 1714680001.000,
+            "client_request_id": "client-tmp-1",
+        },
+        "object_transformed": {
+            "type": "object_transformed",
+            "object_id": "44444444-4444-4444-4444-444444444444",
+            "by_user_id": "22222222-2222-2222-2222-222222222222",
+            "transform": {
+                "position": {"x": 1.2, "y": 1.5, "z": -2.0},
+                "rotation": {"x": 0.0, "y": 45.0, "z": 0.0},
+                "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+            },
+            "server_ts": 1714680001.300,
+            "client_ts": 1714680000600,
+        },
+        "object_destroyed": {
+            "type": "object_destroyed",
+            "object_id": "44444444-4444-4444-4444-444444444444",
+            "by_user_id": "22222222-2222-2222-2222-222222222222",
+            "server_ts": 1714680002.000,
+            "reason": "user_request",
+        },
         "error": {"type": "error", "code": "invalid_json", "message": "Message is not valid JSON"},
     },
     notes=[
         "WebSocket endpoints are not part of OpenAPI; see this endpoint for protocol docs.",
         "transform messages should be sent at 30-90 Hz for VR.",
-        "The server never echoes a transform back to its sender.",
+        "The server never echoes a player transform back to its sender.",
+        "object_spawned is broadcast to ALL (including the spawner) so they get the assigned object_id.",
+        "object_transformed is broadcast to ALL EXCEPT the actor (the actor already has local state).",
+        "object_destroyed is broadcast to ALL (including the actor) as an authoritative ack.",
+        "Only the object owner OR a room moderator (host/moderator) can transform/destroy an object.",
+        "Objects with ephemeral=true are auto-destroyed when their owner disconnects.",
+        "Limits: 256 objects per room, 32 objects per user.",
         "Reconnecting with the same user_id closes the previous connection (code 4000).",
         "For multi-worker deployments add a Redis pub/sub layer (currently single-process).",
     ],
@@ -314,10 +421,11 @@ async def ws_room_sync(websocket: WebSocket, room_id: str, token: Optional[str] 
         return
 
     username: Optional[str] = None
+    is_moderator: bool = False
     try:
         async with AsyncSessionLocal() as db:
             logger.debug("WS lookup: querying room and user from DB")
-            room_result = await db.execute(select(Room.id, Room.is_active).where(Room.id == normalized_room_id))
+            room_result = await db.execute(select(Room.id, Room.is_active, Room.created_by).where(Room.id == normalized_room_id))
             room_row = room_result.first()
             if room_row is None:
                 logger.warning("WS rejected: room not found")
@@ -335,7 +443,23 @@ async def ws_room_sync(websocket: WebSocket, room_id: str, token: Optional[str] 
                 await websocket.close(code=WS_CODE_UNAUTHORIZED, reason="User not found")
                 return
             username = getattr(user, "username", None)
-            logger.debug(f"WS lookup ok: room exists & active, user found username={username!r}")
+
+            if room_row.created_by == user_id:
+                is_moderator = True
+            else:
+                member_result = await db.execute(
+                    select(RoomMember.role).where(
+                        RoomMember.room_id == normalized_room_id,
+                        RoomMember.user_id == user_id,
+                    )
+                )
+                role = member_result.scalar_one_or_none()
+                if role in (RoomMemberRole.HOST.value, RoomMemberRole.MODERATOR.value):
+                    is_moderator = True
+
+            logger.debug(
+                f"WS lookup ok: room exists & active, user found username={username!r} is_moderator={is_moderator}"
+            )
     except Exception as exc:
         logger.exception(f"WS auth/db error: {exc}")
         try:
@@ -359,7 +483,10 @@ async def ws_room_sync(websocket: WebSocket, room_id: str, token: Optional[str] 
         )
 
         snapshot = await room_sync_manager.get_snapshot(normalized_room_id)
-        logger.debug(f"Sending init: participants_in_room={len(snapshot)}")
+        objects_snapshot = await room_sync_manager.get_objects_snapshot(normalized_room_id)
+        logger.debug(
+            f"Sending init: participants_in_room={len(snapshot)} objects_in_room={len(objects_snapshot)}"
+        )
         sent_init = await room_sync_manager.send_to_user(
             normalized_room_id,
             user_id,
@@ -368,6 +495,7 @@ async def ws_room_sync(websocket: WebSocket, room_id: str, token: Optional[str] 
                 self_user_id=user_id,
                 server_ts=time.time(),
                 participants=snapshot,
+                objects=objects_snapshot,
             ),
         )
         if sent_init:
@@ -388,7 +516,7 @@ async def ws_room_sync(websocket: WebSocket, room_id: str, token: Optional[str] 
         )
         logger.info(f"WS join broadcast: recipients={join_recipients}")
 
-        await _receive_loop(websocket, normalized_room_id, user_id, stats, logger)
+        await _receive_loop(websocket, normalized_room_id, user_id, stats, is_moderator, logger)
 
     except WebSocketDisconnect as exc:
         close_reason = f"client_disconnect(code={exc.code})"
@@ -407,8 +535,22 @@ async def ws_room_sync(websocket: WebSocket, room_id: str, token: Optional[str] 
             f"invalid_payload={stats.invalid_payload_count} unknown_type={stats.unknown_type_count}"
         )
 
+        ephemeral_object_ids = await room_sync_manager.pop_ephemeral_objects(normalized_room_id, user_id)
         removed = await room_sync_manager.disconnect(normalized_room_id, user_id, websocket)
         if removed:
+            for object_id in ephemeral_object_ids:
+                ephemeral_recipients = await room_sync_manager.broadcast(
+                    normalized_room_id,
+                    OutgoingObjectDestroyed(
+                        object_id=object_id,
+                        by_user_id=user_id,
+                        server_ts=time.time(),
+                        reason="owner_disconnected",
+                    ),
+                )
+                logger.info(
+                    f"WS ephemeral object_destroyed broadcast: object_id={object_id} recipients={ephemeral_recipients}"
+                )
             leave_recipients = await room_sync_manager.broadcast(
                 normalized_room_id,
                 OutgoingLeave(user_id=user_id, server_ts=time.time()),
@@ -418,7 +560,14 @@ async def ws_room_sync(websocket: WebSocket, room_id: str, token: Optional[str] 
             logger.debug("WS leave broadcast skipped (already replaced/unregistered)")
 
 
-async def _receive_loop(websocket: WebSocket, room_id: UUID, user_id: UUID, stats: _SessionStats, logger) -> None:
+async def _receive_loop(
+    websocket: WebSocket,
+    room_id: UUID,
+    user_id: UUID,
+    stats: _SessionStats,
+    is_moderator: bool,
+    logger,
+) -> None:
     """Основной цикл чтения сообщений от клиента."""
     while True:
         raw = await websocket.receive_text()
@@ -448,6 +597,12 @@ async def _receive_loop(websocket: WebSocket, room_id: UUID, user_id: UUID, stat
             await _handle_ping(room_id, user_id, data, stats, logger)
         elif msg_type == IncomingMessageType.REQUEST_SNAPSHOT.value:
             await _handle_snapshot_request(room_id, user_id, data, stats, logger)
+        elif msg_type == IncomingMessageType.SPAWN_OBJECT.value:
+            await _handle_spawn_object(room_id, user_id, data, stats, logger)
+        elif msg_type == IncomingMessageType.TRANSFORM_OBJECT.value:
+            await _handle_transform_object(room_id, user_id, data, stats, is_moderator, logger)
+        elif msg_type == IncomingMessageType.DESTROY_OBJECT.value:
+            await _handle_destroy_object(room_id, user_id, data, stats, is_moderator, logger)
         else:
             stats.unknown_type_count += 1
             logger.warning(
@@ -530,11 +685,186 @@ async def _handle_snapshot_request(room_id: UUID, user_id: UUID, data: dict, sta
     except ValidationError:
         pass
     snapshot = await room_sync_manager.get_snapshot(room_id)
-    logger.info(f"Snapshot requested by user, participants={len(snapshot)}")
+    objects = await room_sync_manager.get_objects_snapshot(room_id)
+    logger.info(f"Snapshot requested by user, participants={len(snapshot)} objects={len(objects)}")
     sent = await room_sync_manager.send_to_user(
         room_id,
         user_id,
-        OutgoingSnapshot(server_ts=time.time(), participants=snapshot),
+        OutgoingSnapshot(server_ts=time.time(), participants=snapshot, objects=objects),
     )
     if sent:
         stats.msg_out_total += 1
+
+
+async def _handle_spawn_object(
+    room_id: UUID,
+    user_id: UUID,
+    data: dict,
+    stats: _SessionStats,
+    logger,
+) -> None:
+    try:
+        msg = IncomingSpawnObject.model_validate(data)
+    except ValidationError as exc:
+        stats.invalid_payload_count += 1
+        logger.warning(f"Invalid spawn_object payload: errors={exc.error_count()} first_error={exc.errors()[:1]}")
+        sent = await room_sync_manager.send_to_user(
+            room_id,
+            user_id,
+            OutgoingError(code="invalid_spawn_object", message=str(exc.errors())[:512]),
+        )
+        if sent:
+            stats.msg_out_total += 1
+        return
+
+    try:
+        result = await room_sync_manager.spawn_object(
+            room_id=room_id,
+            owner_user_id=user_id,
+            prefab=msg.prefab,
+            transform=msg.transform,
+            data=msg.data,
+            ephemeral=msg.ephemeral,
+        )
+    except ObjectError as exc:
+        logger.warning(f"spawn_object rejected: code={exc.code} message={exc.message}")
+        sent = await room_sync_manager.send_to_user(
+            room_id,
+            user_id,
+            OutgoingError(code=exc.code, message=exc.message),
+        )
+        if sent:
+            stats.msg_out_total += 1
+        return
+
+    state = result.state
+    recipients = await room_sync_manager.broadcast(
+        room_id,
+        OutgoingObjectSpawned(
+            object_id=state.object_id,
+            owner_user_id=state.owner_user_id,
+            prefab=state.prefab,
+            transform=state.transform,
+            data=state.data,
+            ephemeral=state.ephemeral,
+            server_ts=state.server_ts,
+            client_request_id=msg.client_request_id,
+        ),
+    )
+    stats.msg_out_total += recipients
+    logger.info(
+        f"Object spawned & broadcast: room_id={room_id} object_id={state.object_id} "
+        f"owner={user_id} prefab={msg.prefab!r} ephemeral={msg.ephemeral} recipients={recipients}"
+    )
+
+
+async def _handle_transform_object(
+    room_id: UUID,
+    user_id: UUID,
+    data: dict,
+    stats: _SessionStats,
+    is_moderator: bool,
+    logger,
+) -> None:
+    try:
+        msg = IncomingTransformObject.model_validate(data)
+    except ValidationError as exc:
+        stats.invalid_payload_count += 1
+        logger.warning(f"Invalid transform_object payload: errors={exc.error_count()} first_error={exc.errors()[:1]}")
+        sent = await room_sync_manager.send_to_user(
+            room_id,
+            user_id,
+            OutgoingError(code="invalid_transform_object", message=str(exc.errors())[:512]),
+        )
+        if sent:
+            stats.msg_out_total += 1
+        return
+
+    try:
+        result = await room_sync_manager.transform_object(
+            room_id=room_id,
+            object_id=msg.object_id,
+            actor_user_id=user_id,
+            transform=msg.transform,
+            actor_is_moderator=is_moderator,
+        )
+    except ObjectError as exc:
+        logger.warning(f"transform_object rejected: code={exc.code} message={exc.message}")
+        sent = await room_sync_manager.send_to_user(
+            room_id,
+            user_id,
+            OutgoingError(code=exc.code, message=exc.message),
+        )
+        if sent:
+            stats.msg_out_total += 1
+        return
+
+    state = result.state
+    recipients = await room_sync_manager.broadcast(
+        room_id,
+        OutgoingObjectTransformed(
+            object_id=state.object_id,
+            by_user_id=user_id,
+            transform=state.transform,
+            server_ts=state.server_ts,
+            client_ts=msg.client_ts,
+        ),
+        exclude=[user_id],
+    )
+    stats.msg_out_total += recipients
+
+
+async def _handle_destroy_object(
+    room_id: UUID,
+    user_id: UUID,
+    data: dict,
+    stats: _SessionStats,
+    is_moderator: bool,
+    logger,
+) -> None:
+    try:
+        msg = IncomingDestroyObject.model_validate(data)
+    except ValidationError as exc:
+        stats.invalid_payload_count += 1
+        logger.warning(f"Invalid destroy_object payload: errors={exc.error_count()} first_error={exc.errors()[:1]}")
+        sent = await room_sync_manager.send_to_user(
+            room_id,
+            user_id,
+            OutgoingError(code="invalid_destroy_object", message=str(exc.errors())[:512]),
+        )
+        if sent:
+            stats.msg_out_total += 1
+        return
+
+    try:
+        snapshot = await room_sync_manager.destroy_object(
+            room_id=room_id,
+            object_id=msg.object_id,
+            actor_user_id=user_id,
+            actor_is_moderator=is_moderator,
+        )
+    except ObjectError as exc:
+        logger.warning(f"destroy_object rejected: code={exc.code} message={exc.message}")
+        sent = await room_sync_manager.send_to_user(
+            room_id,
+            user_id,
+            OutgoingError(code=exc.code, message=exc.message),
+        )
+        if sent:
+            stats.msg_out_total += 1
+        return
+
+    recipients = await room_sync_manager.broadcast(
+        room_id,
+        OutgoingObjectDestroyed(
+            object_id=snapshot.object_id,
+            by_user_id=user_id,
+            server_ts=time.time(),
+            reason="user_request",
+        ),
+    )
+    stats.msg_out_total += recipients
+    logger.info(
+        f"Object destroyed & broadcast: room_id={room_id} object_id={snapshot.object_id} "
+        f"by_user={user_id} recipients={recipients}"
+    )

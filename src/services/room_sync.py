@@ -2,7 +2,8 @@
 
 В памяти процесса хранит:
 - активные WebSocket-соединения, сгруппированные по `room_id`;
-- последнее известное состояние (transform) каждого участника комнаты.
+- последнее известное состояние (transform) каждого участника комнаты;
+- состояние интерактивных объектов комнаты (spawn/transform/destroy).
 
 Поддерживает многопользовательскую трансляцию: при получении нового
 состояния от одного клиента сообщение мгновенно рассылается остальным
@@ -15,26 +16,57 @@
 
 import asyncio
 import time
-from typing import Dict, Iterable, List, Optional
+import uuid
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from uuid import UUID
 
 from fastapi import WebSocket
 from pydantic import BaseModel
 
 from core.logger import get_logger
-from src.schemas.sync import ParticipantState, TransformPayload
+from src.schemas.sync import (
+    ObjectTransform,
+    ParticipantState,
+    RoomObjectState,
+    TransformPayload,
+)
 
 logger = get_logger()
 
 
-class _RoomState:
-    """Состояние одной комнаты: соединения + последний transform каждого участника."""
+MAX_OBJECTS_PER_ROOM = 256
+MAX_OBJECTS_PER_USER = 32
 
-    __slots__ = ("connections", "participants", "lock")
+
+class ObjectError(Exception):
+    """Ошибка работы с объектом комнаты. `code` — стабильный код для клиента."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+@dataclass
+class SpawnResult:
+    state: RoomObjectState
+
+
+@dataclass
+class TransformObjectResult:
+    state: RoomObjectState
+
+
+class _RoomState:
+    """Состояние одной комнаты: соединения, участники и объекты."""
+
+    __slots__ = ("connections", "participants", "objects", "lock")
 
     def __init__(self) -> None:
         self.connections: Dict[UUID, WebSocket] = {}
         self.participants: Dict[UUID, ParticipantState] = {}
+        self.objects: Dict[UUID, RoomObjectState] = {}
         self.lock = asyncio.Lock()
 
 
@@ -114,6 +146,8 @@ class RoomSyncManager:
 
         Удаление произойдёт только если зарегистрированное соединение совпадает
         с переданным (защита от удаления нового соединения после переподключения).
+        Не удаляет ephemeral-объекты — для этого вызывайте `pop_ephemeral_objects`
+        перед уведомлением остальных клиентов.
         """
         room = self._rooms.get(room_id)
         if room is None:
@@ -135,6 +169,26 @@ class RoomSyncManager:
                     logger.info(f"Room removed from sync manager (empty): room_id={room_id} total_rooms={len(self._rooms)}")
         logger.info(f"WS member unregistered: room_id={room_id} user_id={user_id} room_size={room_size}")
         return True
+
+    async def pop_ephemeral_objects(self, room_id: UUID, owner_user_id: UUID) -> List[UUID]:
+        """Удалить из комнаты все ephemeral-объекты заданного владельца.
+
+        Возвращает список `object_id` удалённых объектов, чтобы вызывающая
+        сторона могла разослать `object_destroyed`. Если комната уже не
+        существует — возвращает пустой список.
+        """
+        room = self._rooms.get(room_id)
+        if room is None:
+            return []
+        async with room.lock:
+            removed = [oid for oid, obj in room.objects.items() if obj.ephemeral and obj.owner_user_id == owner_user_id]
+            for oid in removed:
+                room.objects.pop(oid, None)
+        if removed:
+            logger.info(
+                f"Ephemeral objects removed on disconnect: room_id={room_id} user_id={owner_user_id} count={len(removed)}"
+            )
+        return removed
 
     async def update_transform(
         self,
@@ -165,6 +219,126 @@ class RoomSyncManager:
         async with room.lock:
             snapshot = [s.model_copy(deep=True) for s in room.participants.values()]
         logger.debug(f"Snapshot built: room_id={room_id} participants={len(snapshot)}")
+        return snapshot
+
+    async def get_objects_snapshot(self, room_id: UUID) -> List[RoomObjectState]:
+        """Получить копию состояний всех объектов комнаты."""
+        room = self._rooms.get(room_id)
+        if room is None:
+            return []
+        async with room.lock:
+            snapshot = [o.model_copy(deep=True) for o in room.objects.values()]
+        logger.debug(f"Objects snapshot built: room_id={room_id} objects={len(snapshot)}")
+        return snapshot
+
+    async def spawn_object(
+        self,
+        room_id: UUID,
+        owner_user_id: UUID,
+        prefab: str,
+        transform: ObjectTransform,
+        data: Optional[Dict[str, Any]] = None,
+        ephemeral: bool = False,
+    ) -> SpawnResult:
+        """Создать новый объект в комнате. Возвращает финальное состояние объекта.
+
+        Бросает `ObjectError` с кодом `room_not_active`, `room_object_limit`
+        или `user_object_limit` при нарушениях.
+        """
+        room = self._rooms.get(room_id)
+        if room is None:
+            raise ObjectError("room_not_active", "Room is not active in sync manager")
+
+        now = time.time()
+        async with room.lock:
+            if len(room.objects) >= MAX_OBJECTS_PER_ROOM:
+                raise ObjectError(
+                    "room_object_limit",
+                    f"Room reached max object limit ({MAX_OBJECTS_PER_ROOM})",
+                )
+            user_count = sum(1 for o in room.objects.values() if o.owner_user_id == owner_user_id)
+            if user_count >= MAX_OBJECTS_PER_USER:
+                raise ObjectError(
+                    "user_object_limit",
+                    f"User reached max object limit ({MAX_OBJECTS_PER_USER})",
+                )
+
+            object_id = uuid.uuid4()
+            state = RoomObjectState(
+                object_id=object_id,
+                owner_user_id=owner_user_id,
+                prefab=prefab,
+                transform=transform,
+                data=dict(data) if data else {},
+                ephemeral=ephemeral,
+                server_ts=now,
+            )
+            room.objects[object_id] = state
+
+        logger.info(
+            f"Object spawned: room_id={room_id} object_id={state.object_id} owner={owner_user_id} "
+            f"prefab={prefab!r} ephemeral={ephemeral} room_objects={user_count + 1}"
+        )
+        return SpawnResult(state=state.model_copy(deep=True))
+
+    async def transform_object(
+        self,
+        room_id: UUID,
+        object_id: UUID,
+        actor_user_id: UUID,
+        transform: ObjectTransform,
+        actor_is_moderator: bool = False,
+    ) -> TransformObjectResult:
+        """Обновить transform объекта.
+
+        Доступ разрешён владельцу объекта или модератору комнаты.
+        Бросает `ObjectError` (`room_not_active` | `object_not_found` | `forbidden`).
+        """
+        room = self._rooms.get(room_id)
+        if room is None:
+            raise ObjectError("room_not_active", "Room is not active in sync manager")
+
+        now = time.time()
+        async with room.lock:
+            obj = room.objects.get(object_id)
+            if obj is None:
+                raise ObjectError("object_not_found", f"Object {object_id} not found in room")
+            if obj.owner_user_id != actor_user_id and not actor_is_moderator:
+                raise ObjectError("forbidden", "Only object owner or room moderator can transform it")
+            obj.transform = transform
+            obj.server_ts = now
+            snapshot = obj.model_copy(deep=True)
+
+        return TransformObjectResult(state=snapshot)
+
+    async def destroy_object(
+        self,
+        room_id: UUID,
+        object_id: UUID,
+        actor_user_id: UUID,
+        actor_is_moderator: bool = False,
+    ) -> RoomObjectState:
+        """Удалить объект из комнаты. Возвращает удалённое состояние.
+
+        Доступ разрешён владельцу объекта или модератору комнаты.
+        """
+        room = self._rooms.get(room_id)
+        if room is None:
+            raise ObjectError("room_not_active", "Room is not active in sync manager")
+
+        async with room.lock:
+            obj = room.objects.get(object_id)
+            if obj is None:
+                raise ObjectError("object_not_found", f"Object {object_id} not found in room")
+            if obj.owner_user_id != actor_user_id and not actor_is_moderator:
+                raise ObjectError("forbidden", "Only object owner or room moderator can destroy it")
+            room.objects.pop(object_id, None)
+            snapshot = obj.model_copy(deep=True)
+
+        logger.info(
+            f"Object destroyed: room_id={room_id} object_id={object_id} by_user={actor_user_id} "
+            f"was_owner={snapshot.owner_user_id == actor_user_id}"
+        )
         return snapshot
 
     async def _send_to(self, websocket: WebSocket, message: BaseModel) -> bool:
@@ -211,7 +385,9 @@ class RoomSyncManager:
 
         excluded = set(exclude) if exclude else set()
         async with room.lock:
-            targets = [(uid, ws) for uid, ws in room.connections.items() if uid not in excluded]
+            targets: List[Tuple[UUID, WebSocket]] = [
+                (uid, ws) for uid, ws in room.connections.items() if uid not in excluded
+            ]
 
         msg_type = getattr(message, "type", "?")
         if not targets:
